@@ -6,7 +6,7 @@
 #include "search.h"
 
 #include <algorithm>
-#include <queue>
+#include <cstdlib>
 #include <vector>
 
 Search::Search(Mothership &mothership)
@@ -26,6 +26,14 @@ SearchResult Search::findShipwreck()
     // Store the last safe segment for each robot.
     std::vector<int> limits(robotCount, TETHER_LENGTH);
 
+    // Track each robot's position and debris signal.
+    std::vector<int> positions(robotCount);
+    std::vector<int> signals(robotCount, 0);
+
+    // Track the most recent debris location for each robot.
+    std::vector<int> lastDebris(robotCount, -1);
+
+    // Determine the safe travel limit for each robot.
     for (const Location &abyss : mothership.getAbysses())
     {
         if (abyss.robot >= 0 && abyss.robot < robotCount)
@@ -35,122 +43,133 @@ SearchResult Search::findShipwreck()
         }
     }
 
-    // Track each robot's position and debris signal.
-    std::vector<int> positions(robotCount, 0);
-    std::vector<int> signals(robotCount, 0);
-
-    // A priority queue chooses the most promising robot.
-    struct RobotPriority
-    {
-        int score;
-        int robot;
-
-        bool operator<(const RobotPriority &other) const
-        {
-            if (score != other.score)
-            {
-                return score < other.score;
-            }
-
-            return robot > other.robot;
-        }
-    };
-
-    std::priority_queue<RobotPriority> pq;
-
+    // Get the current position of every robot.
     for (int robot = 0; robot < robotCount; ++robot)
     {
         positions[robot] = mothership.getRobotPosition(robot);
-
-        if (positions[robot] < limits[robot])
-        {
-            pq.push({0, robot});
-        }
     }
 
     int activeRobot = mothership.getActiveRobot();
 
-    while (!pq.empty())
+    // Explore in layers of 1000 segments.
+    const int layerSize = 1000;
+
+    for (int layerStart = 0;
+         layerStart < TETHER_LENGTH;
+         layerStart += layerSize)
     {
-        RobotPriority current = pq.top();
-        pq.pop();
+        bool anyReachable = false;
 
-        const int robot = current.robot;
+        // Store robots that can still explore.
+        std::vector<int> order;
 
-        // Ignore outdated priority entries.
-        if (current.score != signals[robot])
+        for (int robot = 0; robot < robotCount; ++robot)
         {
-            continue;
-        }
-
-        if (positions[robot] >= limits[robot])
-        {
-            continue;
-        }
-
-        if (activeRobot != robot)
-        {
-            mothership.switchToRobot(robot);
-            activeRobot = robot;
-        }
-
-        
-        // Explore up to 10 drives before choosing another robot.
-        // Each drive still respects the 100-segment limit.
-        const int drivesPerTurn = 10;
-
-        for (int drive = 0; drive < drivesPerTurn; ++drive)
-        {
-            if (positions[robot] >= limits[robot])
+            if (positions[robot] < limits[robot])
             {
-                break;
-            }
-
-            const int safeDistance =
-                limits[robot] - positions[robot];
-
-            const int distance = std::min(
-                MAX_SEGMENTS_PER_DRIVE, safeDistance);
-
-            DriveResult result =
-                mothership.driveActiveRobot(distance);
-
-            positions[robot] = mothership.getRobotPosition(robot);
-
-            if (result.reason == DriveStopReason::ShipwreckFound)
-            {
-                return SearchResult{
-                    true,
-                    Location{robot, positions[robot]}
-                };
-            }
-
-            if (result.reason == DriveStopReason::DebrisFound)
-            {
-                seafloorSurvey.recordDebris(
-                    Location{robot, positions[robot]});
-
-                
-              for (int offset = -1; offset <= 1; ++offset)
-              {
-                  int neighbor =
-                    (robot + offset + robotCount) % robotCount;
-
-                  if (positions[neighbor] < limits[neighbor])
-                  {
-                      ++signals[neighbor];
-                      pq.push({signals[neighbor], neighbor});
-                  }
-              }
+                order.push_back(robot);
+                anyReachable = true;
             }
         }
 
-
-        if (positions[robot] < limits[robot])
+        // Stop if no robots can travel farther.
+        if (!anyReachable)
         {
-            pq.push({signals[robot], robot});
+            break;
+        }
+
+        // Prioritize robots with recent nearby debris.
+        std::sort(order.begin(), order.end(),
+            [&](int a, int b)
+            {
+                int scoreA = 0;
+                int scoreB = 0;
+
+                if (lastDebris[a] >= 0 &&
+                    std::abs(positions[a] - lastDebris[a])
+                        <= SIGNAL_RANGE)
+                {
+                    scoreA = signals[a];
+                }
+
+                if (lastDebris[b] >= 0 &&
+                    std::abs(positions[b] - lastDebris[b])
+                        <= SIGNAL_RANGE)
+                {
+                    scoreB = signals[b];
+                }
+
+                if (scoreA != scoreB)
+                {
+                    return scoreA > scoreB;
+                }
+
+                return a < b;
+            });
+
+        // Explore robots in priority order.
+        for (int robot : order)
+        {
+            int target = std::min(
+                limits[robot], layerStart + layerSize);
+
+            if (positions[robot] >= target)
+            {
+                continue;
+            }
+
+            // Switch to the selected robot if necessary.
+            if (activeRobot != robot)
+            {
+                mothership.switchToRobot(robot);
+                activeRobot = robot;
+            }
+
+            // Drive until the robot reaches this layer's target.
+            while (positions[robot] < target)
+            {
+                int distance = std::min(
+                    MAX_SEGMENTS_PER_DRIVE,
+                    target - positions[robot]);
+
+                DriveResult result =
+                    mothership.driveActiveRobot(distance);
+
+                positions[robot] =
+                    mothership.getRobotPosition(robot);
+
+                // Return immediately if the shipwreck is found.
+                if (result.reason ==
+                    DriveStopReason::ShipwreckFound)
+                {
+                    return SearchResult{
+                        true,
+                        Location{robot, positions[robot]}
+                    };
+                }
+
+                // Record debris and update nearby robot signals.
+                if (result.reason ==
+                    DriveStopReason::DebrisFound)
+                {
+                    seafloorSurvey.recordDebris(
+                        Location{robot, positions[robot]});
+
+                    for (int offset = -1;
+                         offset <= 1; ++offset)
+                    {
+                        int neighbor =
+                            (robot + offset + robotCount)
+                            % robotCount;
+
+                        ++signals[neighbor];
+                        lastDebris[neighbor] = positions[robot];
+                    }
+                }
+            }
         }
     }
 
+    // No reachable shipwreck was found.
     return SearchResult{false, Location{}};
 }
